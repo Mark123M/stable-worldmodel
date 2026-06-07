@@ -1,8 +1,16 @@
 """One-shot H100 Nsight Systems profiling for PushT MPC evaluation.
 
-Run:
+Upload the checkpoint once, then run. The dataset is fetched and
+decompressed server-side by ``bootstrap`` (no multi-GB local upload):
 
+    modal volume put stable-worldmodel-cache \
+        ~/.stable_worldmodel/checkpoints/models--quentinll--lewm-pusht \
+        checkpoints/
     modal run scripts/modal/profile_h100.py
+
+Stage inputs only (download dataset, skip the H100 profile):
+
+    modal run scripts/modal/profile_h100.py::bootstrap
 
 Download reports:
 
@@ -11,7 +19,6 @@ Download reports:
 
 from __future__ import annotations
 
-import hashlib
 import os
 import re
 import shutil
@@ -31,10 +38,7 @@ REMOTE_REPO_ROOT = Path('/workspace/stable-worldmodel')
 DATASET_NAME = 'pusht_expert_train.h5'
 DATASET_URL = (
     'https://huggingface.co/datasets/quentinll/lewm-pusht/'
-    'resolve/main/pusht_expert_train.h5.zst?download=true'
-)
-DATASET_SHA256 = (
-    '7cfbd6d90fa2f27876379a5ff169715a36ed82edbda64f9e5b5bfa34d212f318'
+    'resolve/main/pusht_expert_train.h5.zst'
 )
 MODEL_ID = 'quentinll/lewm-pusht'
 
@@ -74,16 +78,17 @@ PYTHON_PACKAGES = (
     'torch',
     'torchvision',
     'tqdm',
-    'transformers',
+    'transformers==4.50.0',
     'typer',
     'wandb',
     'zstandard',
 )
 
-CHUNK_SIZE = 16 * 1024 * 1024
-COMMIT_INTERVAL = 1024 * 1024 * 1024
-
-repo_root = Path(__file__).resolve().parents[2]
+repo_root = (
+    Path(__file__).resolve().parents[2]
+    if modal.is_local()
+    else REMOTE_REPO_ROOT
+)
 source_ignore = modal.FilePatternMatcher(
     '.git/**',
     '.venv/**',
@@ -123,8 +128,10 @@ image = (
     )
     .run_commands(
         'python -c "'
+        'import re; '
         'from importlib.metadata import version; '
-        f'names={PYTHON_PACKAGES!r}; '
+        f'specs={PYTHON_PACKAGES!r}; '
+        "names=[re.split(r'[=<>]', s, 1)[0] for s in specs]; "
         'print({name: version(name) for name in names})'
         '"',
         'python -c "'
@@ -167,133 +174,20 @@ cache_volume = modal.Volume.from_name(
 )
 
 
-def _sha256(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open('rb') as file:
-        while chunk := file.read(CHUNK_SIZE):
-            digest.update(chunk)
-    return digest.hexdigest()
-
-
-def _sync_file(file) -> None:
-    file.flush()
-    os.fsync(file.fileno())
-
-
-def _download_dataset_archive(archive: Path) -> None:
-    import requests
-
-    if archive.exists():
-        print(f'[bootstrap] verifying cached archive: {archive}')
-        if _sha256(archive) == DATASET_SHA256:
-            return
-        print(
-            '[bootstrap] cached archive checksum mismatch; downloading again'
-        )
-        archive.unlink()
-
-    partial = archive.with_suffix(f'{archive.suffix}.part')
-    offset = partial.stat().st_size if partial.exists() else 0
-    headers = {'Range': f'bytes={offset}-'} if offset else {}
-
-    print(f'[bootstrap] downloading {DATASET_URL} from byte offset {offset:,}')
-    with requests.get(
-        DATASET_URL,
-        allow_redirects=True,
-        headers=headers,
-        stream=True,
-        timeout=(30, 300),
-    ) as response:
-        if offset and response.status_code == 416:
-            if _sha256(partial) == DATASET_SHA256:
-                partial.replace(archive)
-                cache_volume.commit()
-                return
-            partial.unlink()
-            cache_volume.commit()
-            raise RuntimeError(
-                'Dataset server rejected the resume offset and the partial '
-                'archive checksum is invalid; rerun bootstrap to restart it'
-            )
-
-        response.raise_for_status()
-        if offset and response.status_code != 206:
-            print('[bootstrap] server ignored Range; restarting download')
-            offset = 0
-
-        mode = 'ab' if offset else 'wb'
-        written = offset
-        next_commit = written + COMMIT_INTERVAL
-        file = partial.open(mode)
-        try:
-            for chunk in response.iter_content(chunk_size=CHUNK_SIZE):
-                if not chunk:
-                    continue
-                file.write(chunk)
-                written += len(chunk)
-                if written >= next_commit:
-                    print(f'[bootstrap] downloaded {written:,} bytes')
-                    _sync_file(file)
-                    file.close()
-                    cache_volume.commit()
-                    file = partial.open('ab')
-                    next_commit = written + COMMIT_INTERVAL
-        finally:
-            if not file.closed:
-                _sync_file(file)
-                file.close()
-            cache_volume.commit()
-
-    partial.replace(archive)
-    cache_volume.commit()
-
-    print(f'[bootstrap] verifying SHA256 for {archive}')
-    actual_sha256 = _sha256(archive)
-    if actual_sha256 != DATASET_SHA256:
-        archive.unlink()
-        cache_volume.commit()
-        raise RuntimeError(
-            'PushT archive checksum mismatch: '
-            f'expected {DATASET_SHA256}, got {actual_sha256}'
-        )
-
-
-def _decompress_dataset(archive: Path, dataset_path: Path) -> None:
-    import zstandard
-
-    partial = dataset_path.with_suffix(f'{dataset_path.suffix}.part')
-    if partial.exists():
-        print('[bootstrap] restarting interrupted dataset decompression')
-        partial.unlink()
-
-    print(f'[bootstrap] decompressing {archive} to {dataset_path}')
-    decompressor = zstandard.ZstdDecompressor()
-    written = 0
-    next_commit = COMMIT_INTERVAL
-    with (
-        archive.open('rb') as compressed,
-        decompressor.stream_reader(compressed) as reader,
-        partial.open('wb') as output,
-    ):
-        while chunk := reader.read(CHUNK_SIZE):
-            output.write(chunk)
-            written += len(chunk)
-            if written >= next_commit:
-                print(f'[bootstrap] decompressed {written:,} bytes')
-                next_commit = written + COMMIT_INTERVAL
-        _sync_file(output)
-
-    _validate_dataset(partial)
-    partial.replace(dataset_path)
-    archive.unlink()
-    cache_volume.commit()
-
-
 def _validate_dataset(dataset_path: Path) -> None:
     import h5py
 
     with h5py.File(dataset_path, 'r') as dataset:
-        required = {'ep_len', 'ep_offset', 'pixels', 'action'}
+        required = {
+            'action',
+            'ep_len',
+            'ep_offset',
+            'episode_idx',
+            'pixels',
+            'proprio',
+            'state',
+            'step_idx',
+        }
         missing = required.difference(dataset.keys())
         if missing:
             raise RuntimeError(
@@ -301,6 +195,45 @@ def _validate_dataset(dataset_path: Path) -> None:
             )
         if len(dataset['ep_len']) == 0:
             raise RuntimeError('PushT dataset contains no episodes')
+        row_count = len(dataset['episode_idx'])
+        for key in required - {'ep_len', 'ep_offset'}:
+            if len(dataset[key]) != row_count:
+                raise RuntimeError(
+                    f'PushT dataset column {key!r} has '
+                    f'{len(dataset[key]):,} rows; expected {row_count:,}'
+                )
+        print(
+            f'[bootstrap] validated {len(dataset["ep_len"]):,} episodes '
+            f'and {row_count:,} rows'
+        )
+
+
+def _download_dataset(dataset_path: Path) -> None:
+    """Fetch the zstd-compressed HDF5 from HF and decompress onto the volume.
+
+    Runs server-side on the Modal CPU container, so the ~12 GiB compressed
+    download never crosses the local uplink. Streams decompression in a
+    single pass to a ``.part`` file, validates it, then atomically renames.
+    Idempotent: a failed run leaves only the ``.part`` and reruns restart.
+    """
+    import requests
+    import zstandard
+
+    partial = dataset_path.with_suffix(f'{dataset_path.suffix}.part')
+    print(f'[bootstrap] downloading + decompressing {DATASET_URL}')
+    decompressor = zstandard.ZstdDecompressor()
+    with requests.get(DATASET_URL, stream=True, timeout=(30, 300)) as response:
+        response.raise_for_status()
+        response.raw.decode_content = True
+        with partial.open('wb') as output:
+            read, written = decompressor.copy_stream(response.raw, output)
+            output.flush()
+            os.fsync(output.fileno())
+    print(f'[bootstrap] decompressed {read:,} -> {written:,} bytes')
+
+    _validate_dataset(partial)
+    partial.replace(dataset_path)
+    cache_volume.commit()
 
 
 @app.function(
@@ -308,22 +241,29 @@ def _validate_dataset(dataset_path: Path) -> None:
     volumes={CACHE_ROOT: cache_volume},
     cpu=4,
     memory=16 * 1024,
+    max_containers=1,
     timeout=6 * 60 * 60,
     scaledown_window=2,
 )
 def bootstrap() -> dict[str, str]:
     """Populate the persistent dataset and checkpoint cache."""
     dataset_path = CACHE_ROOT / 'datasets' / DATASET_NAME
-    archive = CACHE_ROOT / 'downloads' / f'{DATASET_NAME}.zst'
     dataset_path.parent.mkdir(parents=True, exist_ok=True)
-    archive.parent.mkdir(parents=True, exist_ok=True)
 
     if dataset_path.exists():
-        print(f'[bootstrap] dataset already exists: {dataset_path}')
+        print(f'[bootstrap] dataset exists: {dataset_path}')
         _validate_dataset(dataset_path)
     else:
-        _download_dataset_archive(archive)
-        _decompress_dataset(archive, dataset_path)
+        _download_dataset(dataset_path)
+
+    for legacy_path in (
+        dataset_path.with_suffix(f'{dataset_path.suffix}.part'),
+        CACHE_ROOT / 'downloads' / f'{DATASET_NAME}.zst',
+        CACHE_ROOT / 'downloads' / f'{DATASET_NAME}.zst.part',
+    ):
+        if legacy_path.exists():
+            print(f'[bootstrap] removing obsolete partial: {legacy_path}')
+            legacy_path.unlink()
 
     checkpoint_dir = (
         CACHE_ROOT / 'checkpoints' / f'models--{MODEL_ID.replace("/", "--")}'
