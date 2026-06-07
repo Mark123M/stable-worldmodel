@@ -1,5 +1,6 @@
 """Cross Entropy Method solver for model-based planning."""
 
+from contextlib import nullcontext
 import time
 from typing import Any
 
@@ -120,6 +121,17 @@ class CEMSolver:
         self, info_dict: dict, init_action: torch.Tensor | None = None
     ) -> dict:
         """Solve the planning problem using Cross Entropy Method."""
+        nvtx_range = (
+            torch.cuda.nvtx.range('CEMSolver.solve')
+            if torch.device(self.device).type == 'cuda'
+            else nullcontext()
+        )
+        with nvtx_range:
+            return self._solve(info_dict, init_action)
+
+    def _solve(
+        self, info_dict: dict, init_action: torch.Tensor | None = None
+    ) -> dict:
         start_time = time.time()
         outputs = {
             'costs': [],
